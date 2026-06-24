@@ -8,7 +8,7 @@ Tech Stack: FastAPI + Neon PostgreSQL + Cloudinary
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -192,6 +192,27 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+# --- Telegram Bot Webhook ---
+@app.post("/bot/webhook/{token}", include_in_schema=False)
+async def telegram_webhook(token: str, request: Request):
+    """
+    Telegram webhook endpoint.
+    Telegram sends updates here when WEBHOOK_URL is configured.
+    """
+    import os
+    bot_token = os.getenv("BOT_TOKEN") or settings.BOT_TOKEN
+    if token != bot_token:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+    try:
+        from app.bot import process_update
+        update_data = await request.json()
+        await process_update(update_data)
+    except Exception as e:
+        print(f"[WARN] Webhook processing error: {e}")
+    return {"ok": True}
 
 # --- WebSockets ---
 class ConnectionManager:

@@ -1,3 +1,8 @@
+"""
+Telegram Bot — Verification code generation.
+Supports both polling (local dev) and webhook (production/Render).
+"""
+
 import asyncio
 import os
 import random
@@ -8,7 +13,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import engine
 from app.config import settings
@@ -22,19 +26,17 @@ async def ensure_verification_table() -> None:
     global table_ready
     if table_ready:
         return
-    # The table is already created in main.py lifespan, but we can keep this for safety
     table_ready = True
 
 
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
     await ensure_verification_table()
-    
-    # We create a new session just for this request
+
     from app.database import async_session_maker
     async with async_session_maker() as session:
         from app.models.telegram_verification import TelegramVerificationCode
-        
+
         # Clear expired codes
         await session.execute(
             delete(TelegramVerificationCode).where(
@@ -42,6 +44,7 @@ async def command_start_handler(message: Message) -> None:
             )
         )
 
+        # Generate unique 5-digit code
         code = str(random.randint(10000, 99999))
         existing = await session.execute(
             select(TelegramVerificationCode).where(TelegramVerificationCode.code == code)
@@ -60,7 +63,8 @@ async def command_start_handler(message: Message) -> None:
                 telegram_id=message.from_user.id,
                 first_name=message.from_user.first_name,
                 username=message.from_user.username,
-                expires_at=datetime.utcnow() + timedelta(days=3650),
+                # Long expiry so codes don't expire unexpectedly
+                expires_at=datetime.utcnow() + timedelta(days=365),
             )
         )
         await session.commit()
@@ -76,12 +80,41 @@ async def command_start_handler(message: Message) -> None:
 
 
 async def start_bot() -> None:
-    token = os.getenv("BOT_TOKEN")
+    """
+    Start the bot.
+    - If WEBHOOK_URL env var is set → use webhook mode (production/Render).
+    - Otherwise → use polling mode (local development).
+    """
+    token = os.getenv("BOT_TOKEN") or settings.BOT_TOKEN
     if not token:
         print("[WARN] BOT_TOKEN topilmadi, Telegram bot ishga tushmaydi.")
         return
-        
+
     global bot
     bot = Bot(token=token)
-    print("[OK] Telegram bot started.")
-    await dp.start_polling(bot)
+
+    webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+
+    if webhook_url:
+        # --- WEBHOOK MODE (Render/production) ---
+        webhook_path = f"/bot/webhook/{token}"
+        full_webhook_url = f"{webhook_url}{webhook_path}"
+
+        await bot.set_webhook(
+            url=full_webhook_url,
+            drop_pending_updates=True,
+        )
+        print(f"[OK] Telegram bot webhook set: {full_webhook_url}")
+        # Bot will receive updates via the /bot/webhook/<token> route
+        # registered in main.py — no blocking polling needed here.
+    else:
+        # --- POLLING MODE (local dev) ---
+        print("[OK] Telegram bot started (polling mode).")
+        await dp.start_polling(bot)
+
+
+async def process_update(update_data: dict) -> None:
+    """Process a single update received via webhook."""
+    from aiogram.types import Update
+    update = Update(**update_data)
+    await dp.feed_update(bot, update)

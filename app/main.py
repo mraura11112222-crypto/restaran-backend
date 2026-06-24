@@ -19,6 +19,50 @@ from fastapi.responses import JSONResponse
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
+
+    # --- Always run critical DB setup (works in both DEBUG and production) ---
+    try:
+        from sqlalchemy import text
+        from app.database import engine
+        async with engine.begin() as conn:
+            # Ensure users table has all needed columns
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(512);"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS branch_id UUID;"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_id BIGINT;"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(255);"))
+            try:
+                await conn.execute(text("ALTER TABLE users ALTER COLUMN phone DROP NOT NULL;"))
+            except Exception:
+                pass
+            try:
+                await conn.execute(text("ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;"))
+            except Exception:
+                pass
+            # Telegram verification codes table — CRITICAL for registration
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS telegram_verification_codes (
+                    id UUID PRIMARY KEY,
+                    code VARCHAR(10) NOT NULL UNIQUE,
+                    telegram_id BIGINT NOT NULL,
+                    first_name VARCHAR(255),
+                    username VARCHAR(255),
+                    expires_at TIMESTAMP NOT NULL,
+                    used BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tgvc_code ON telegram_verification_codes (code);"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tgvc_tg_id ON telegram_verification_codes (telegram_id);"))
+            try:
+                await conn.execute(text("ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'SUPER_ADMIN';"))
+            except Exception:
+                pass
+        print("[OK] Critical DB setup completed.")
+    except Exception as e:
+        print(f"[WARN] Critical DB setup error (may be first run): {e}")
+
+    # --- Run Alembic migrations only in DEBUG mode ---
     if settings.DEBUG:
         try:
             from alembic.config import Config
@@ -28,42 +72,11 @@ async def lifespan(app: FastAPI):
                 asyncio.to_thread(command.upgrade, alembic_cfg, "head"),
                 timeout=15,
             )
-            print("[OK] Alembic migrations applied successfully.")
-
-            from sqlalchemy import text
-            from app.database import engine
-            async with engine.begin() as conn:
-                await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;"))
-                await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(512);"))
-                await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS branch_id UUID;"))
-                await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_id BIGINT;"))
-                await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(255);"))
-                await conn.execute(text("ALTER TABLE users ALTER COLUMN phone DROP NOT NULL;"))
-                await conn.execute(text("ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;"))
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS telegram_verification_codes (
-                        id UUID PRIMARY KEY,
-                        code VARCHAR(10) NOT NULL UNIQUE,
-                        telegram_id BIGINT NOT NULL,
-                        first_name VARCHAR(255),
-                        username VARCHAR(255),
-                        expires_at TIMESTAMP NOT NULL,
-                        used BOOLEAN NOT NULL DEFAULT FALSE,
-                        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-                    );
-                """))
-                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_telegram_verification_codes_code ON telegram_verification_codes (code);"))
-                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_telegram_verification_codes_telegram_id ON telegram_verification_codes (telegram_id);"))
-                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_telegram_verification_codes_expires_at ON telegram_verification_codes (expires_at);"))
-                try:
-                    await conn.execute(text("ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'SUPER_ADMIN';"))
-                except Exception:
-                    pass
-            print("[OK] Manual DB fixes applied successfully.")
+            print("[OK] Alembic migrations applied.")
         except Exception as e:
-            print(f"[WARN] Alembic migrations / DB fixes failed: {e}")
+            print(f"[WARN] Alembic migrations failed: {e}")
     else:
-        print("[OK] Startup migrations skipped because DEBUG is false.")
+        print("[OK] Production mode — Alembic skipped, critical setup already done.")
 
     # Start Telegram Bot in background
     bot_task = None
@@ -73,13 +86,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Failed to start Telegram Bot: {e}")
 
-    if settings.DEBUG:
-        try:
-            await init_db()
-            print("[OK] Database connected successfully")
-        except Exception as e:
-            print(f"[WARN] Database connection failed: {e}")
-            print("   Server will start without database. Set DATABASE_URL in .env")
+    try:
+        await init_db()
+        print("[OK] Database connected successfully")
+    except Exception as e:
+        print(f"[WARN] Database connection check failed: {e}")
     yield
     # Shutdown (cleanup if needed)
 
